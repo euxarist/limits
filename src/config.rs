@@ -3,6 +3,9 @@
 use crate::model::{LimitsConfig, Provider, ProviderConfig};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// The user's home directory.
 ///
@@ -82,7 +85,10 @@ pub fn save(config: &LimitsConfig) -> io::Result<()> {
 /// Restricts permissions on Unix to owner-only (`0o600`) because the file
 /// stores API keys and session credentials in plain text.
 pub fn save_to(path: &Path, config: &LimitsConfig) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         #[cfg(unix)]
         {
             use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -104,21 +110,84 @@ pub fn save_to(path: &Path, config: &LimitsConfig) -> io::Result<()> {
     let data = serde_json::to_string_pretty(config)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
-    }
     use std::io::Write;
-    file.write_all(data.as_bytes())
+    write_atomically(path, |file| file.write_all(data.as_bytes()))
+}
+
+fn write_atomically(
+    path: &Path,
+    write: impl FnOnce(&mut std::fs::File) -> io::Result<()>,
+) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let (temp_path, mut file) = loop {
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temp_path = parent.join(format!(
+            ".limits-config-{}-{sequence}.tmp",
+            std::process::id()
+        ));
+
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+
+        match options.open(&temp_path) {
+            Ok(file) => break (temp_path, file),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    };
+
+    let result = (|| {
+        write(&mut file)?;
+        file.sync_all()?;
+        drop(file);
+        replace_file(&temp_path, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    result?;
+
+    #[cfg(unix)]
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
+    std::fs::rename(from, to)
+}
+
+#[cfg(windows)]
+fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MoveFileExW};
+
+    let from: Vec<u16> = from
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let to: Vec<u16> = to
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: Both paths are NUL-terminated UTF-16 strings that remain alive
+    // for the duration of the call.
+    let replaced = unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_REPLACE_EXISTING) };
+    if replaced == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -162,10 +231,34 @@ mod tests {
         let mut config = LimitsConfig::default();
         config.get_mut("Grok").unwrap().api_key = "xai-test".into();
         save_to(&path, &config).unwrap();
+        config.get_mut("Grok").unwrap().api_key = "updated-test".into();
+        save_to(&path, &config).unwrap();
 
         let reloaded: LimitsConfig =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(reloaded.get("grok").unwrap().api_key, "xai-test");
+        assert_eq!(reloaded.get("grok").unwrap().api_key, "updated-test");
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1,
+            "temporary config file should be renamed away"
+        );
+    }
+
+    #[test]
+    fn a_failed_write_preserves_the_previous_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, "original config").unwrap();
+
+        let result = write_atomically(&path, |file| {
+            use std::io::Write;
+            file.write_all(b"partial config")?;
+            Err(io::Error::other("simulated write failure"))
+        });
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "original config");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]

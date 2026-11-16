@@ -20,7 +20,8 @@ struct Bucket {
 }
 
 impl Bucket {
-    fn into_window(self, label: &str, seconds: i64) -> UsageWindow {
+    fn into_window(self, label: &str, seconds: i64) -> Option<UsageWindow> {
+        let utilization = self.utilization?;
         let countdown = match self.resets_at.as_deref().map(str::trim) {
             None | Some("") => format_duration(seconds),
             Some(at) => {
@@ -32,9 +33,11 @@ impl Bucket {
                 }
             }
         };
-        UsageWindow::new(label, self.utilization.unwrap_or(0.0))
-            .reset(countdown)
-            .seconds(seconds)
+        Some(
+            UsageWindow::new(label, utilization)
+                .reset(countdown)
+                .seconds(seconds),
+        )
     }
 }
 
@@ -49,12 +52,14 @@ pub fn parse(body: &str) -> Vec<UsageWindow> {
         return Vec::new();
     };
 
-    let weekly = payload.seven_day.map(|b| b.into_window("Weekly", 7 * DAY));
+    let weekly = payload
+        .seven_day
+        .and_then(|b| b.into_window("Weekly", 7 * DAY));
     let weekly_spent = weekly.as_ref().is_some_and(UsageWindow::is_spent);
     let session = payload
         .five_hour
         .filter(|_| !weekly_spent)
-        .map(|b| b.into_window("Session", 5 * HOUR));
+        .and_then(|b| b.into_window("Session", 5 * HOUR));
 
     [session, weekly].into_iter().flatten().collect()
 }
@@ -128,5 +133,13 @@ mod tests {
         assert!(parse("{}").is_empty());
         assert!(parse("not json").is_empty());
         assert!(parse("[]").is_empty());
+    }
+
+    #[test]
+    fn buckets_without_utilization_are_not_reported_as_empty_quota() {
+        assert!(
+            parse(r#"{"five_hour":{},"seven_day":{}}"#).is_empty(),
+            "missing utilization must not become a healthy 0%-used reading"
+        );
     }
 }

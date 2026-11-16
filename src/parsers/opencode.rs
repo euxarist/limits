@@ -28,28 +28,30 @@ struct Bucket {
     #[serde(default)]
     status: String,
     #[serde(default)]
-    percent: f64,
+    percent: Option<f64>,
     #[serde(default, rename = "resetsAt")]
     resets_at: String,
 }
 
 impl Bucket {
-    fn into_window(self, label: &str, seconds: i64) -> UsageWindow {
+    fn into_window(self, label: &str, seconds: i64) -> Option<UsageWindow> {
         // The service reports whole percents, so a spent window arrives as 100.
         // `status` is the authority regardless: a window it calls rate-limited
         // is spent even if the rounded percentage has not caught up.
         let percent = if self.is_rate_limited() {
             100.0
         } else {
-            self.percent
+            self.percent?
         };
         let countdown = match self.resets_at.trim() {
             "" => "Unknown".to_string(),
             at => format_countdown(at),
         };
-        UsageWindow::new(label, percent)
-            .reset(countdown)
-            .seconds(seconds)
+        Some(
+            UsageWindow::new(label, percent)
+                .reset(countdown)
+                .seconds(seconds),
+        )
     }
 
     fn is_rate_limited(&self) -> bool {
@@ -68,12 +70,15 @@ pub fn parse(body: &str) -> Vec<UsageWindow> {
         payload
             .usage
             .rolling
-            .map(|b| b.into_window("Rolling", 5 * HOUR)),
-        payload.usage.weekly.map(|b| b.into_window("Weekly", WEEK)),
+            .and_then(|b| b.into_window("Rolling", 5 * HOUR)),
+        payload
+            .usage
+            .weekly
+            .and_then(|b| b.into_window("Weekly", WEEK)),
         payload
             .usage
             .monthly
-            .map(|b| b.into_window("Monthly", 30 * DAY)),
+            .and_then(|b| b.into_window("Monthly", 30 * DAY)),
     ]
     .into_iter()
     .flatten()
@@ -145,5 +150,20 @@ mod tests {
         assert!(parse("{}").is_empty());
         assert!(parse(r#"{"usage":{}}"#).is_empty());
         assert!(parse("not json").is_empty());
+    }
+
+    #[test]
+    fn a_window_without_percent_is_not_reported_as_empty_quota() {
+        assert!(
+            parse(r#"{"usage":{"weekly":{"status":"ok"}}}"#).is_empty(),
+            "missing percent must not become a healthy 0%-used reading"
+        );
+    }
+
+    #[test]
+    fn rate_limited_status_is_enough_to_report_an_exhausted_window() {
+        let windows = parse(r#"{"usage":{"weekly":{"status":"rate-limited"}}}"#);
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].used_percent, 100.0);
     }
 }
