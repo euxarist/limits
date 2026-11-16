@@ -13,15 +13,18 @@
 use crate::Limits;
 use crate::model::{ProviderUsage, Status, UsageWindow};
 use crate::time::{countdown_between, countdown_seconds, now_unix};
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Gauge, Paragraph};
-use ratatui::{Frame, TerminalOptions, Viewport};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
 use std::collections::HashMap;
+use std::io;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
+use stele::{
+    Block, Borders, Clear, Color, Constraint, CrosstermBackend, Frame, Layout, Line, Modifier,
+    Paragraph, Rect, Span, Style, Terminal,
+};
 
 /// How often the screen is redrawn. Fast enough that a countdown ticking from
 /// `2m` to `1m` looks immediate, slow enough to stay invisible in a CPU graph.
@@ -320,12 +323,13 @@ fn dim() -> Style {
 fn draw(frame: &mut Frame, app: &App) {
     frame.render_widget(Clear, frame.area());
 
-    let [header, body, footer] = Layout::vertical([
+    let areas = Layout::vertical([
         Constraint::Length(1),
         Constraint::Fill(1),
         Constraint::Length(1),
     ])
-    .areas(frame.area());
+    .split(frame.area());
+    let [header, body, footer] = [areas[0], areas[1], areas[2]];
 
     draw_header(frame, header, app);
 
@@ -342,8 +346,9 @@ fn draw(frame: &mut Frame, app: &App) {
             .unwrap_or(12)
             .clamp(16, 28) as u16
             + 16;
-        let [list, detail] =
-            Layout::horizontal([Constraint::Length(list_width), Constraint::Fill(1)]).areas(body);
+        let areas =
+            Layout::horizontal([Constraint::Length(list_width), Constraint::Fill(1)]).split(body);
+        let [list, detail] = [areas[0], areas[1]];
         draw_list(frame, list, app, &visible);
         draw_detail(frame, detail, app, &visible);
     }
@@ -392,13 +397,13 @@ fn draw_empty(frame: &mut Frame, area: Rect, app: &App) {
         "No provider reported usable quota. Press 'a' to show errors."
     };
     frame.render_widget(
-        Paragraph::new(Line::styled(message, dim())).block(Block::bordered()),
+        Paragraph::new(Line::styled(message, dim())).block(Block::default().borders(Borders::ALL)),
         area,
     );
 }
 
 fn draw_list(frame: &mut Frame, area: Rect, app: &App, visible: &[&LiveProvider]) {
-    let block = Block::bordered().title(" Providers ");
+    let block = Block::default().borders(Borders::ALL).title(" Providers ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -447,7 +452,7 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App, visible: &[&LiveProvide
         Span::raw(&usage.display_name),
         Span::raw(" "),
     ]);
-    let block = Block::bordered().title(title);
+    let block = Block::default().borders(Borders::ALL).title(title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.height == 0 {
@@ -469,19 +474,21 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App, visible: &[&LiveProvide
     // Two rows per window (label line, then the bar), then the trend and the
     // footer.
     let window_rows = (usage.windows.len() as u16) * 2;
-    let [windows_area, rest] = Layout::vertical([
+    let areas = Layout::vertical([
         Constraint::Length(window_rows.min(inner.height)),
         Constraint::Fill(1),
     ])
-    .areas(inner);
+    .split(inner);
+    let [windows_area, rest] = [areas[0], areas[1]];
 
     draw_windows(frame, windows_area, provider);
 
     if rest.height == 0 {
         return;
     }
-    let [trend, footer] =
-        Layout::vertical([Constraint::Length(rest.height.min(2)), Constraint::Fill(1)]).areas(rest);
+    let areas =
+        Layout::vertical([Constraint::Length(rest.height.min(2)), Constraint::Fill(1)]).split(rest);
+    let [trend, footer] = [areas[0], areas[1]];
     draw_trend(frame, trend, app, &usage.id);
 
     if footer.height > 0 && !usage.footer.trim().is_empty() {
@@ -535,14 +542,21 @@ fn draw_windows(frame: &mut Frame, area: Rect, provider: &LiveProvider) {
         // `ratio` rather than `percent` so a bar does not snap to whole
         // percentage points as the number creeps.
         if let Some(remaining) = window.remaining_percent {
-            frame.render_widget(
-                Gauge::default()
-                    .ratio(remaining / 100.0)
-                    .label("")
-                    .gauge_style(Style::new().fg(severity(window.window.used_percent)))
-                    .style(dim()),
-                rows[bar_row],
-            );
+            let bar_area = rows[bar_row];
+            let ratio = (remaining / 100.0).clamp(0.0, 1.0);
+            let filled = (ratio * f64::from(bar_area.width)).round() as u16;
+            let buffer = frame.buffer_mut();
+            buffer.set_style(bar_area, dim());
+            if filled > 0 {
+                buffer.set_string(
+                    bar_area.x,
+                    bar_area.y,
+                    &"█".repeat(filled as usize),
+                    Style::new()
+                        .fg(severity(window.window.used_percent))
+                        .add_modifier(Modifier::DIM),
+                );
+            }
         }
     }
 }
@@ -654,17 +668,81 @@ fn format_elapsed(seconds: u64) -> String {
 
 /// Run the dashboard until the user quits.
 pub fn run(interval: Option<u64>, provider_filter: Option<String>) -> std::io::Result<()> {
-    let mut terminal = ratatui::try_init_with_options(TerminalOptions {
-        viewport: Viewport::Fullscreen,
-    })?;
+    let mut session = TerminalSession::enter()?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     terminal.clear()?;
     let result = event_loop(&mut terminal, interval, provider_filter);
-    ratatui::restore();
-    result
+    let restore = session.restore();
+    match (result, restore) {
+        (Err(error), Err(restore_error)) => Err(io::Error::other(format!(
+            "{error}; terminal restoration also failed: {restore_error}"
+        ))),
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+struct TerminalSession {
+    raw_mode: bool,
+    alternate_screen: bool,
+}
+
+impl TerminalSession {
+    fn enter() -> io::Result<Self> {
+        enable_raw_mode()?;
+        let mut session = Self {
+            raw_mode: true,
+            alternate_screen: true,
+        };
+        if let Err(error) = crossterm::execute!(io::stdout(), EnterAlternateScreen) {
+            return Err(session.restore_after(error));
+        }
+        Ok(session)
+    }
+
+    fn restore(&mut self) -> io::Result<()> {
+        let mut first_error = None;
+        if self.alternate_screen {
+            match crossterm::execute!(io::stdout(), crossterm::cursor::Show, LeaveAlternateScreen) {
+                Ok(()) => self.alternate_screen = false,
+                Err(error) => first_error = Some(error),
+            }
+        }
+        if self.raw_mode {
+            match disable_raw_mode() {
+                Ok(()) => self.raw_mode = false,
+                Err(error) => {
+                    first_error = Some(match first_error {
+                        Some(previous) => io::Error::other(format!(
+                            "{previous}; raw mode restoration also failed: {error}"
+                        )),
+                        None => error,
+                    })
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    fn restore_after(&mut self, error: io::Error) -> io::Error {
+        match self.restore() {
+            Ok(()) => error,
+            Err(restore_error) => io::Error::other(format!(
+                "{error}; terminal restoration also failed: {restore_error}"
+            )),
+        }
+    }
+}
+
+impl Drop for TerminalSession {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
 }
 
 fn event_loop(
-    terminal: &mut ratatui::DefaultTerminal,
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     interval: Option<u64>,
     provider_filter: Option<String>,
 ) -> std::io::Result<()> {
@@ -732,6 +810,7 @@ fn event_loop(
 mod tests {
     use super::*;
     use crate::model::Provider;
+    use stele::{Buffer, TestBackend};
 
     fn healthy(id: &str, percent: f64, reset: &str) -> ProviderUsage {
         let mut usage = ProviderUsage::healthy(
@@ -929,18 +1008,13 @@ mod tests {
         buffer_text(&render_with(width, height, |frame| draw(frame, app)))
     }
 
-    fn render_with(
-        width: u16,
-        height: u16,
-        draw: impl FnMut(&mut Frame),
-    ) -> ratatui::buffer::Buffer {
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+    fn render_with(width: u16, height: u16, draw: impl FnOnce(&mut Frame)) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(draw).unwrap();
         terminal.backend().buffer().clone()
     }
 
-    fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
+    fn buffer_text(buffer: &Buffer) -> String {
         buffer.content().iter().map(|cell| cell.symbol()).collect()
     }
 
@@ -1061,13 +1135,17 @@ mod tests {
                 let cell = &buffer[(x, 1)];
                 if x < filled {
                     assert!(
-                        (cell.symbol() == "█" && cell.fg == Color::Green)
-                            || (cell.symbol() == " " && cell.bg == Color::Green),
+                        cell.symbol() == "█" && cell.style().fg == Some(Color::Green),
                         "width {width}, x {x}: {cell:?}"
                     );
                 } else {
                     assert_eq!(cell.symbol(), " ", "width {width}, x {x}");
-                    assert_eq!(cell.bg, Color::Reset, "width {width}, x {x}");
+                    assert_eq!(cell.style().fg, None, "width {width}, x {x}");
+                    assert_eq!(cell.style().bg, None, "width {width}, x {x}");
+                    assert!(
+                        cell.style().add_modifier.contains(Modifier::DIM),
+                        "width {width}, x {x}"
+                    );
                 }
             }
         }
@@ -1116,8 +1194,7 @@ mod tests {
             for x in 0..40 {
                 let cell = &buffer[(x, 1)];
                 assert_eq!(cell.symbol(), " ", "{text}, x {x}");
-                assert_eq!(cell.fg, Color::Reset, "{text}, x {x}");
-                assert_eq!(cell.bg, Color::Reset, "{text}, x {x}");
+                assert_eq!(cell.style(), Style::default(), "{text}, x {x}");
             }
             let mut app = App::new(60);
             app.apply(vec![usage]);
@@ -1208,7 +1285,7 @@ mod tests {
             let screen = buffer_text(&buffer);
             assert!(screen.contains("trend (% left)"), "{screen}");
             assert!(screen.trim_end().ends_with(expected), "{screen}");
-            assert_eq!(buffer[(16, 0)].fg, Color::Red);
+            assert_eq!(buffer[(16, 0)].style().fg, Some(Color::Red));
         }
     }
 
@@ -1250,7 +1327,7 @@ mod tests {
             assert!(buffer_text(&buffer).contains(left));
             let cell = &buffer[(0, 1)];
             assert_eq!(cell.symbol(), "█");
-            assert_eq!(cell.fg, colour);
+            assert_eq!(cell.style().fg, Some(colour));
             let filled = (100.0 - used).round() as u16;
             assert_eq!(buffer[(filled - 1, 1)].symbol(), "█");
             assert_eq!(buffer[(filled, 1)].symbol(), " ");
@@ -1262,7 +1339,7 @@ mod tests {
                 buffer
                     .content()
                     .iter()
-                    .any(|cell| cell.symbol() == "%" && cell.fg == colour)
+                    .any(|cell| cell.symbol() == "%" && cell.style().fg == Some(colour))
             );
         }
     }

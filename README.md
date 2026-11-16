@@ -138,9 +138,9 @@ There is no async runtime anywhere in this crate: reads are blocking and run con
 | Feature | Default | Pulls in                       | What it gives you                          |
 |---------|---------|---------------------------------|---------------------------------------------|
 | `cli`   | on      | —                                | `limits::cli` and argument/terminal helpers |
-| `tui`   | on      | `ratatui` (implies `cli`)       | `limits::tui`, the full-screen dashboard    |
+| `tui`   | on      | `stele` and `crossterm` (implies `cli`) | `limits::tui`, the full-screen dashboard |
 
-A pure library consumer (like cairn-code) takes `default-features = false` and gets only the model, config, credentials, parsers, and fetch logic — no `ratatui`, no terminal-rendering code, no CLI argument parsing.
+A pure library consumer (like cairn-code) takes `default-features = false` and gets only the model, config, credentials, parsers, and fetch logic — no Stele or Crossterm dependency, no terminal-rendering code, no CLI argument parsing. Building with the default `tui` feature requires the local Stele checkout configured in `Cargo.toml` and Rust 1.97 or newer.
 
 ---
 
@@ -160,7 +160,7 @@ limits/
 │   ├── time.rs             # RFC 3339 parsing and countdown formatting, no date crate
 │   ├── redact.rs           # Email masking for footers and JSON output
 │   ├── cli.rs (feature)     # Argument parsing, ANSI rendering, the `status` report
-│   └── tui.rs (feature)     # The full-screen ratatui dashboard
+│   └── tui.rs (feature)     # The full-screen Stele dashboard
 └── Cargo.toml
 ```
 
