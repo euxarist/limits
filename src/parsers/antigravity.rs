@@ -295,10 +295,9 @@ fn from_groups(groups: &[Value]) -> Vec<Bucket> {
                 .get("disabled")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            let remaining = entry
-                .get("remainingFraction")
-                .and_then(Value::as_f64)
-                .unwrap_or(0.0);
+            let Some(remaining) = entry.get("remainingFraction").and_then(Value::as_f64) else {
+                continue;
+            };
             let reset_iso = entry
                 .get("resetTime")
                 .and_then(Value::as_str)
@@ -382,10 +381,9 @@ fn from_flat_buckets(raw: &[Value]) -> Vec<Bucket> {
             .get("disabled")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let remaining = entry
-            .get("remainingFraction")
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0);
+        let Some(remaining) = entry.get("remainingFraction").and_then(Value::as_f64) else {
+            continue;
+        };
         let reset_iso = entry
             .get("resetTime")
             .and_then(Value::as_str)
@@ -489,6 +487,18 @@ mod tests {
     fn an_empty_payload_yields_nothing() {
         assert!(parse("{}").is_empty());
         assert!(parse("not json").is_empty());
+    }
+
+    #[test]
+    fn buckets_without_remaining_fraction_are_ignored() {
+        assert!(
+            parse(r#"{"buckets":[{"modelId":"gemini-pro"}]}"#).is_empty(),
+            "missing remainingFraction must not become a 100%-used reading"
+        );
+        assert!(
+            parse(r#"{"groups":[{"displayName":"Gemini","buckets":[{}]}]}"#).is_empty(),
+            "missing remainingFraction must not become a 100%-used reading"
+        );
     }
 
     #[test]

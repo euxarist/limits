@@ -180,6 +180,14 @@ impl<'a> Fetcher<'a> {
             Err(message) => return ProviderUsage::degraded(Provider::Claude, message),
         };
 
+        let windows = claude::parse(&response.body);
+        if windows.is_empty() {
+            return ProviderUsage::degraded(
+                Provider::Claude,
+                "Claude usage API reported no windows",
+            );
+        }
+
         let mut email = token.email.clone();
         if email.is_empty() {
             email = self.claude_profile_email(&token.access_token);
@@ -190,8 +198,7 @@ impl<'a> Fetcher<'a> {
             .map(|plan| plan.display_name.as_str())
             .unwrap_or_default();
         let footer = account_footer("Claude CLI", &[&email, name]);
-        let mut result =
-            ProviderUsage::healthy(Provider::Claude, claude::parse(&response.body), footer);
+        let mut result = ProviderUsage::healthy(Provider::Claude, windows, footer);
         result.plan = plan;
         result
     }
@@ -237,7 +244,14 @@ impl<'a> Fetcher<'a> {
             Err(message) => return ProviderUsage::degraded(Provider::Claude, message),
         };
 
-        ProviderUsage::healthy(Provider::Claude, claude::parse(&usage.body), "Claude Web")
+        let windows = claude::parse(&usage.body);
+        if windows.is_empty() {
+            return ProviderUsage::degraded(
+                Provider::Claude,
+                "Claude usage API reported no windows",
+            );
+        }
+        ProviderUsage::healthy(Provider::Claude, windows, "Claude Web")
     }
 
     fn claude_profile_email(&self, access_token: &str) -> String {
@@ -1328,6 +1342,21 @@ mod tests {
             );
             assert_eq!(usage.plan.unwrap().tier, tier);
         }
+    }
+
+    #[test]
+    fn claude_rejects_success_responses_without_quota_windows() {
+        let http = FakeHttp::new(vec![("oauth/usage", 200, r#"{"five_hour":{}}"#)]);
+        let token = Token {
+            access_token: "test-token".into(),
+            email: "reader@example.com".into(),
+            ..Default::default()
+        };
+
+        let usage = Fetcher::new(&http).claude_oauth(&token);
+        assert_eq!(usage.status, crate::model::Status::Degraded);
+        assert!(usage.windows.is_empty());
+        assert!(usage.error_message.contains("reported no windows"));
     }
 
     const GROK_USER: &str = r#"{"email":"grokuser@example.com"}"#;
